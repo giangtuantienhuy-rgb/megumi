@@ -1,10 +1,9 @@
 # ==============================================================================
-# MEGUMI FUSHIGURO BOT v3.0 - ANTI-429 EDITION
-# - Khung chống rate-limit lấy từ bản Reimu v2.2 (backoff trong process, không
-#   thoát process -> Render không restart dồn dập, không đăng nhập lại liên tục)
-# - Gemini: client async + timeout + retry + xoay key + tự dò model còn tồn tại
-# - Lệnh slash nằm trong Cog -> tạo lại bot sau mỗi lần backoff vẫn đăng ký đủ
-# - Kinh tế dùng thao tác "trừ nguyên tử" (chống bấm đúp / spam trừ âm tiền)
+# MEGUMI FUSHIGURO BOT v3.1 - REIMU SKELETON EDITION
+# - Khung xương y hệt bản Reimu v2.3 (web server mở TRƯỚC, lệnh slash đăng ký
+#   trong setup_hook, backoff trong process, tự dò model, xoay key, retry)
+# - Giữ nguyên: kinh tế, cờ bạc (slot/coinflip), thức thần (shop/buy/use), boss raid
+# - MỚI: cooldown 2 phút cho /slot, /coinflip, /use (đổi bằng GAME_COOLDOWN, giây)
 # ==============================================================================
 import os
 import re
@@ -50,8 +49,51 @@ def _env_bool(name, default=False):
 
 adb = asyncio.to_thread  # chạy hàm DB (blocking) ở thread riêng, không làm đơ bot
 
+
 # ==============================================================================
-# 0. HẰNG SỐ CHUNG
+# 1. WEB SERVER & KEEP-ALIVE CHO RENDER / HOSTING FREE (CHẠY TRƯỚC TIÊN)
+# ==============================================================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Megumi Fushiguro Discord Bot is running online!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        server.serve_forever()
+    except Exception as e:
+        print(f"⚠️ [WEB] Web server lỗi: {e}", flush=True)
+
+
+def keep_alive_ping():
+    import urllib.request
+    port = int(os.environ.get("PORT", 10000))
+    url = os.environ.get("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{port}/"
+    while True:
+        time.sleep(240)
+        try:
+            urllib.request.urlopen(url, timeout=10)
+        except Exception:
+            pass
+
+
+threading.Thread(target=run_web_server, daemon=True).start()
+threading.Thread(target=keep_alive_ping, daemon=True).start()
+
+# ==============================================================================
+# 2. HẰNG SỐ CHUNG
 # ==============================================================================
 AUTHORIZED_ADMIN_ID = 1502579398560317441   # Han Seiki / Developer
 VN_TZ = timezone(timedelta(hours=7))
@@ -75,7 +117,7 @@ def to_vn_date(value):
 
 
 # ==============================================================================
-# 1. DATABASE: MONGODB (vĩnh viễn) + FALLBACK SQLITE
+# 3. DATABASE: MONGODB (vĩnh viễn) + FALLBACK SQLITE
 # ==============================================================================
 MONGO_URI = os.getenv("MONGO_URI")
 SQLITE_PATH = os.getenv("SQLITE_PATH", "megumi_data.db")
@@ -316,49 +358,37 @@ def user_lock(uid):
     return lock
 
 
-# ==============================================================================
-# 2. WEB SERVER & KEEP-ALIVE CHO RENDER / HOSTING FREE
-# ==============================================================================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Megumi Fushiguro Discord Bot is running online!")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
+# ------------------------------------------------------------------------------
+# COOLDOWN 2 PHÚT CHO CỜ BẠC / THỨC THẦN (/slot, /coinflip, /use)
+# ------------------------------------------------------------------------------
+GAME_COOLDOWN = _env_int("GAME_COOLDOWN", 120)   # giây
+_game_cd = {}                                    # (user_id, tên lệnh) -> thời điểm hết cooldown
 
 
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    try:
-        HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-    except Exception as e:
-        print(f"⚠️ [WEB] Web server lỗi: {e}", flush=True)
+def cd_remaining(uid, cmd):
+    return max(0.0, _game_cd.get((int(uid), cmd), 0.0) - time.time())
 
 
-def keep_alive_ping():
-    import urllib.request
-    port = int(os.environ.get("PORT", 10000))
-    url = os.environ.get("RENDER_EXTERNAL_URL") or f"http://127.0.0.1:{port}/"
-    while True:
-        time.sleep(240)
-        try:
-            urllib.request.urlopen(url, timeout=10)
-        except Exception:
-            pass
+def cd_start(uid, cmd):
+    _game_cd[(int(uid), cmd)] = time.time() + GAME_COOLDOWN
+    if len(_game_cd) > 5000:
+        now = time.time()
+        for k in [k for k, v in _game_cd.items() if v < now]:
+            _game_cd.pop(k, None)
 
 
-threading.Thread(target=run_web_server, daemon=True).start()
-threading.Thread(target=keep_alive_ping, daemon=True).start()
+def cd_clear(uid, cmd):
+    _game_cd.pop((int(uid), cmd), None)
+
+
+def fmt_wait(seconds):
+    seconds = int(seconds) + 1
+    m, s = divmod(seconds, 60)
+    return f"{m} phút {s} giây" if m else f"{s} giây"
+
 
 # ==============================================================================
-# 3. CẤU HÌNH GEMINI (XOAY KEY + FALLBACK MODEL + TỰ DÒ MODEL)
+# 4. CẤU HÌNH GEMINI (XOAY KEY + FALLBACK MODEL + TỰ DÒ MODEL)
 # ==============================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -579,7 +609,7 @@ async def ask_gemini(contents, system_instruction, temperature=0.8):
 
 
 # ==============================================================================
-# 4. SYSTEM PROMPT MEGUMI (GIỮ NGUYÊN)
+# 5. SYSTEM PROMPT MEGUMI (GIỮ NGUYÊN)
 # ==============================================================================
 MEGUMI_SYSTEM_PROMPT = """
 Bạn là Megumi Fushiguro, chú thuật sư cấp 1 trong Jujutsu Kaisen (Chú Thuật Hồi Chiến).
@@ -600,17 +630,17 @@ XƯNG HÔ:
 """
 
 # ==============================================================================
-# 5. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD
+# 6. TIỆN ÍCH CHỐNG RATE-LIMIT DISCORD
 # ==============================================================================
 discord_blocked_until = 0.0
 USER_COOLDOWN_SECONDS = 3.0
 user_last_request = {}
 
-# Mỗi lần "đang nhập..." là 1 request tới Discord -> dễ gây 429. Mặc định TẮT.
 TYPING_INDICATOR = _env_bool("TYPING_INDICATOR", False)
-# Sau khi đã sync xong 1 lần, có thể đặt SYNC_COMMANDS=0 để không sync mỗi lần khởi động.
 SYNC_COMMANDS = _env_bool("SYNC_COMMANDS", True)
-_commands_synced = False
+
+# Chỉ cho phép ping USER cụ thể, không bao giờ ping @everyone / role
+SAFE_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
 
 
 def mark_discord_blocked(seconds=120):
@@ -660,25 +690,42 @@ class SafeTyping:
         return False
 
 
+def split_message(text, limit=1900):
+    """Chia nhỏ tin nhắn, ưu tiên cắt ở xuống dòng / khoảng trắng."""
+    text = text or "..."
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit * 0.5:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit * 0.5:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text.strip():
+        chunks.append(text)
+    return chunks or ["..."]
+
+
 async def safe_reply(message: discord.Message, text: str):
     """Gửi trả lời an toàn: tự chia nhỏ, tự fallback sang channel.send, không văng lỗi."""
     if is_discord_blocked():
         print("⏸️ [BỎ QUA] Đang bị Discord chặn tạm thời, không gửi tin.", flush=True)
         return
 
-    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or ["..."]
+    chunks = split_message(text)
     for idx, chunk in enumerate(chunks):
         try:
             if idx == 0:
-                await message.reply(chunk, mention_author=False)
+                await message.reply(chunk, mention_author=False, allowed_mentions=SAFE_MENTIONS)
             else:
-                await message.channel.send(chunk)
+                await message.channel.send(chunk, allowed_mentions=SAFE_MENTIONS)
         except discord.HTTPException as e:
             handle_discord_http_error(e)
             if e.status == 429:
                 return
             try:
-                await message.channel.send(chunk)
+                await message.channel.send(chunk, allowed_mentions=SAFE_MENTIONS)
             except Exception as e2:
                 print(f"❌ [GỬI TIN THẤT BẠI] {e2}", flush=True)
                 return
@@ -693,6 +740,7 @@ async def safe_send(target, *args, **kwargs):
     """channel.send không bao giờ văng lỗi; trả về message hoặc None."""
     if is_discord_blocked():
         return None
+    kwargs.setdefault("allowed_mentions", SAFE_MENTIONS)
     try:
         return await target.send(*args, **kwargs)
     except discord.HTTPException as e:
@@ -703,7 +751,7 @@ async def safe_send(target, *args, **kwargs):
 
 
 # ==============================================================================
-# 6. KINH TẾ: CỬA HÀNG, CHAT REWARD
+# 7. KINH TẾ: CỬA HÀNG, CHAT REWARD
 # ==============================================================================
 SHOP_ITEMS = {
     "ngoc_khuyen": {"name": "Ngọc Khuyển", "price": 1600, "desc": "Mute đối phương 2 phút"},
@@ -733,9 +781,9 @@ async def maybe_reward_chat(user_id):
 
 
 # ==============================================================================
-# 7. BOSS RAID (DỊ THỂ MEGUMI)
+# 8. BOSS RAID (DỊ THỂ MEGUMI)
 # ==============================================================================
-# LƯU Ý: link ảnh Discord CDN có tham số "ex=" là hạn dùng -> thường hết hạn sau vài tuần.
+# Link ảnh Discord CDN có tham số "ex=" là hạn dùng -> thường hết hạn sau vài tuần.
 # Hãy upload lại ảnh và đặt link mới vào biến môi trường BOSS_IMAGE_URL (để trống = không hiện ảnh).
 BOSS_IMAGE_URL = os.getenv(
     "BOSS_IMAGE_URL",
@@ -940,11 +988,12 @@ async def _run_boss(channel):
 
 
 # ==============================================================================
-# 8. LỆNH SLASH (TRONG COG -> TỰ ĐĂNG KÝ LẠI MỖI LẦN TẠO BOT MỚI)
+# 9. BOT CHÍNH (LỆNH SLASH ĐĂNG KÝ TRONG setup_hook NHƯ REIMU)
 # ==============================================================================
-def is_owner(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == AUTHORIZED_ADMIN_ID
-
+INITIAL_LOGIN_BACKOFF = 300   # 5 phút
+MAX_LOGIN_BACKOFF = 1800      # 30 phút
+login_backoff = INITIAL_LOGIN_BACKOFF
+_commands_synced = False
 
 NOT_OWNER_MSG = "❌ Kẻ mạo danh! Chỉ có Chủ nhân (Developer) mới được dùng quyền này."
 
@@ -956,410 +1005,20 @@ ITEM_CHOICES = [
 ]
 
 
-class MegumiCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+def is_owner(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == AUTHORIZED_ADMIN_ID
 
-    # ---------- THÔNG TIN ----------
-    @app_commands.command(name="check", description="Kiểm tra lượng Chú lực và Chuỗi điểm danh của bạn")
-    async def check_stats(self, interaction: discord.Interaction):
-        data = await adb(get_user, interaction.user.id)
-        embed = discord.Embed(
-            title="📊 Thông Tin Chú Thuật Sư",
-            description=(
-                f"**{interaction.user.display_name}**\n\n"
-                f"🔹 **Chú lực:** {data[1]:,}\n🔥 **Chuỗi điểm danh (Streak):** {data[3]} ngày"
-            ),
-            color=0x2F3136,
-        )
-        if interaction.user.display_avatar:
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="daily", description="Điểm danh mỗi ngày để nhận Chú lực")
-    async def daily_reward(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        async with user_lock(uid):
-            data = await adb(get_user, uid)
-            streak = data[3]
-            now = now_vn()
-            today = now.date()
-            last_date = to_vn_date(data[2])
-            reward = 100
-
-            if last_date == today:
-                await interaction.response.send_message(
-                    "Hôm nay cậu đã nạp chú lực rồi. Đừng làm phiền, quay lại vào ngày mai.", ephemeral=True
-                )
-                return
-            if last_date == today - timedelta(days=1):
-                streak += 1
-                reward += min(streak * 10, 200)
-            else:
-                streak = 1
-
-            await adb(update_user_daily, uid, reward, now.isoformat(), streak)
-
-        embed = discord.Embed(
-            title="🎁 Nạp Chú Lực Hằng Ngày",
-            description=f"Cậu đã nhận được **{reward} Chú lực**.\n🔥 **Streak hiện tại:** {streak} ngày",
-            color=0x10B981,
-        )
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="top", description="Bảng xếp hạng Chú lực")
-    async def top_chu_luc(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        top_users = await adb(get_top_users, 10)
-        if not top_users:
-            await interaction.followup.send("Chưa có ai sở hữu Chú lực cả.")
-            return
-        desc = "".join(f"**{i}.** <@{uid}> - {cl:,} Chú lực\n" for i, (uid, cl) in enumerate(top_users, 1))
-        await interaction.followup.send(embed=discord.Embed(title="🏆 Bảng Xếp Hạng Chú Lực", description=desc, color=0x3B82F6))
-
-    @app_commands.command(name="clearmem", description="Xóa sạch ký ức trò chuyện của Megumi với cậu")
-    async def slash_clear_memory(self, interaction: discord.Interaction):
-        reset_memory(interaction.channel_id, interaction.user.id)
-        if interaction.user.id == AUTHORIZED_ADMIN_ID:
-            desc = "Tôi đã xóa sạch những chuyện lặt vặt vừa rồi. Có nhiệm vụ gì mới sao, Seiki?"
-        else:
-            desc = f"Những chuyện không cần thiết tôi đã bỏ qua hết rồi. Vào việc chính đi, {interaction.user.display_name}."
+async def block_if_cooldown(interaction: discord.Interaction, cmd: str) -> bool:
+    """True nếu đang cooldown (đã báo cho người dùng)."""
+    rem = cd_remaining(interaction.user.id, cmd)
+    if rem > 0:
         await interaction.response.send_message(
-            embed=discord.Embed(title="🧹 Làm Mới Trạng Thái", description=desc, color=0x2C2F33)
+            f"⏳ Bình tĩnh đi. Cậu phải chờ **{fmt_wait(rem)}** nữa mới dùng lại lệnh này được.",
+            ephemeral=True,
         )
-
-    # ---------- CỜ BẠC ----------
-    @app_commands.command(name="slot", description="Cược Chú lực vào Slot Machine")
-    @app_commands.describe(amount="Số lượng Chú lực muốn cược")
-    async def slot_machine(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1_000_000_000]):
-        uid = str(interaction.user.id)
-        if not await adb(try_spend, uid, amount):
-            data = await adb(get_user, uid)
-            await interaction.response.send_message(f"Không đủ Chú lực. Cậu chỉ có {data[1]:,}.", ephemeral=True)
-            return
-
-        slots = ["🐺", "🦉", "🐸", "🐍", "🐰", "🐘", "🐂", "🦌"]
-        result = [random.choice(slots) for _ in range(3)]
-        won = True
-        if result[0] == result[1] == result[2]:
-            winnings = amount * 5
-            msg = f"Tốt lắm. Trúng giải độc đắc rồi. Cậu nhận được **{winnings:,} Chú lực**."
-        elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
-            winnings = amount * 2
-            msg = f"Cũng tạm. Cậu nhận được **{winnings:,} Chú lực**."
-        else:
-            winnings = 0
-            won = False
-            msg = f"Thua trắng rồi. Cậu mất **{amount:,} Chú lực**. Lần sau tính toán kỹ hơn đi."
-        if winnings:
-            await adb(update_user_chu_luc, uid, winnings)
-
-        embed = discord.Embed(
-            title="🎰 Rút Bài Chú Lực (Slot)",
-            description=f"**[ {result[0]} | {result[1]} | {result[2]} ]**\n\n{msg}",
-            color=0xF59E0B if won else 0xDC2626,
-        )
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="coinflip", description="Tung đồng xu cược Chú lực (Thắng x2)")
-    @app_commands.describe(amount="Số Chú lực cược", choice="Chọn Sấp hoặc Ngửa")
-    @app_commands.choices(choice=[
-        app_commands.Choice(name="Sấp (Heads)", value="sap"),
-        app_commands.Choice(name="Ngửa (Tails)", value="ngua"),
-    ])
-    async def coinflip(self, interaction: discord.Interaction,
-                       amount: app_commands.Range[int, 1, 1_000_000_000],
-                       choice: app_commands.Choice[str]):
-        uid = str(interaction.user.id)
-        if not await adb(try_spend, uid, amount):
-            data = await adb(get_user, uid)
-            await interaction.response.send_message(f"Cậu không đủ Chú lực (Đang có: {data[1]:,})", ephemeral=True)
-            return
-
-        outcome = random.choice(["sap", "ngua"])
-        label = "Sấp" if outcome == "sap" else "Ngửa"
-        if choice.value == outcome:
-            await adb(update_user_chu_luc, uid, amount * 2)
-            await interaction.response.send_message(
-                f"🪙 Đồng xu ra **{label}**!\n🎉 Cậu đã thắng và nhận được **{amount * 2:,} Chú lực** (Lãi {amount:,})."
-            )
-        else:
-            await interaction.response.send_message(
-                f"🪙 Đồng xu ra **{label}**!\n💀 Cậu đoán sai và mất **{amount:,} Chú lực**."
-            )
-
-    @app_commands.command(name="dungeon", description="Khám phá Hầm ngục. Phí: 2,000 CL. Nhận 1k-11k CL (1 lần/ngày)")
-    async def dungeon(self, interaction: discord.Interaction):
-        uid = str(interaction.user.id)
-        async with user_lock(uid):
-            today = now_vn().strftime("%Y-%m-%d")
-            if await adb(get_last_dungeon, uid) == today:
-                await interaction.response.send_message(
-                    "❌ Cậu đã vào Hầm ngục ngày hôm nay rồi, hãy quay lại vào ngày mai nhé!", ephemeral=True
-                )
-                return
-            if not await adb(try_spend, uid, 2000):
-                data = await adb(get_user, uid)
-                await interaction.response.send_message(
-                    f"❌ Cậu không đủ 2,000 Chú lực để vào Hầm ngục (Hiện tại có {data[1]:,}).", ephemeral=True
-                )
-                return
-            await adb(set_last_dungeon, uid, today)
-            reward = random.randint(1000, 11000)
-            await adb(update_user_chu_luc, uid, reward)
-
-        profit = reward - 2000
-        if profit > 0:
-            msg = f"🎉 **{interaction.user.display_name}** đã dũng cảm bước vào Hầm ngục và tìm thấy **{reward:,} Chú lực**! (Lãi {profit:,} CL)"
-        else:
-            msg = f"🏚️ **{interaction.user.display_name}** bước vào Hầm ngục nhưng chỉ thu thập được **{reward:,} Chú lực**. (Lỗ {-profit:,} CL)"
-        await interaction.response.send_message(
-            embed=discord.Embed(title="⚔️ Khám phá Hầm ngục", description=msg, color=0x3B82F6 if profit > 0 else 0xEF4444)
-        )
-
-    # ---------- CỬA HÀNG / THỨC THẦN ----------
-    @app_commands.command(name="shop", description="Cửa hàng Thức thần")
-    async def shop(self, interaction: discord.Interaction):
-        desc = "".join(
-            f"**{v['name']}** - 💰 {v['price']:,} Chú lực\n↳ *{v['desc']}*\n\n" for v in SHOP_ITEMS.values()
-        )
-        embed = discord.Embed(title="🛒 Cửa Hàng Thức Thần", description=desc, color=0x8B5CF6)
-        embed.set_footer(text="Dùng lệnh /buy để mua và /use để dùng")
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="buy", description="Mua vật phẩm từ cửa hàng")
-    @app_commands.choices(item=ITEM_CHOICES)
-    async def buy_item(self, interaction: discord.Interaction, item: app_commands.Choice[str]):
-        uid = str(interaction.user.id)
-        info = SHOP_ITEMS[item.value]
-        async with user_lock(uid):
-            data = await adb(get_user, uid)
-            if item.value == "mahoraga" and data[8] > 0:
-                await interaction.response.send_message("Cậu đã sở hữu Mahoraga rồi, mua thêm làm gì?", ephemeral=True)
-                return
-            if not await adb(try_spend, uid, info["price"]):
-                await interaction.response.send_message(
-                    f"Không đủ tiền. Cậu chỉ có {data[1]:,} Chú lực (cần {info['price']:,}).", ephemeral=True
-                )
-                return
-            await adb(update_user_item, uid, item.value, 1)
-        await interaction.response.send_message(f"🛍️ Cậu đã mua thành công **{info['name']}**!")
-
-    @app_commands.command(name="inventory", description="Xem túi đồ của cậu")
-    async def inventory(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        d = await adb(get_user, interaction.user.id)
-        desc = (
-            f"**Ngọc Khuyển:** {d[5]}\n**Nue:** {d[6]}\n**Thoát Thố:** {d[7]}\n"
-            f"**Mahoraga:** {'Có (Vĩnh viễn)' if d[8] > 0 else 'Không'}"
-        )
-        await interaction.followup.send(embed=discord.Embed(title="🎒 Túi Đồ Thức Thần", description=desc, color=0x22C55E))
-
-    @app_commands.command(name="use", description="Dùng Thức thần tấn công (Mute) đối phương")
-    @app_commands.guild_only()
-    @app_commands.choices(item=[
-        app_commands.Choice(name="Ngọc Khuyển (Mute 2p)", value="ngoc_khuyen"),
-        app_commands.Choice(name="Nue (Mute 5p)", value="nue"),
-    ])
-    async def use_item(self, interaction: discord.Interaction, item: app_commands.Choice[str], target: discord.Member):
-        if target.id == interaction.user.id:
-            await interaction.response.send_message("Bị ngốc à? Tự đánh mình làm gì.", ephemeral=True)
-            return
-        if target.bot:
-            await interaction.response.send_message("Thức thần không đánh bot.", ephemeral=True)
-            return
-        if target.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "Đối phương là Admin (Kẻ Vô Hạ Hạn), Thức thần của cậu không thể chạm vào họ!", ephemeral=True
-            )
-            return
-
-        name = SHOP_ITEMS[item.value]["name"]
-        attacker = interaction.user
-        async with user_lock(attacker.id):
-            if not await adb(try_consume_item, attacker.id, item.value):
-                await interaction.response.send_message(
-                    f"Cậu không có {name}. Hãy vào /shop để mua.", ephemeral=True
-                )
-                return
-
-        target_data = await adb(get_user, target.id)
-        if target_data[8] > 0:
-            await interaction.response.send_message(
-                f"🐺 **{attacker.display_name}** tung {name} tấn công {target.mention}!\n"
-                f"🛡️ NHƯNG! Bánh xe luân hồi quay... **Mahoraga** của {target.display_name} đã thích nghi và hóa giải hoàn toàn đòn tấn công!"
-            )
-            return
-
-        dodge_msg = ""
-        if target_data[7] > 0 and await adb(try_consume_item, target.id, "thoat_tho"):
-            bonus = thoat_tho_bonus.get(target.id, 0.0)
-            total_chance = 0.40 + bonus
-            if random.random() <= total_chance:
-                thoat_tho_bonus[target.id] = 0.0
-                await interaction.response.send_message(
-                    f"🐺 **{attacker.display_name}** tung {name} tấn công {target.mention}!\n"
-                    f"🐇 Đàn **Thoát Thố** của {target.display_name} xuất hiện đánh lạc hướng thành công "
-                    f"(Tỷ lệ né: {int(total_chance * 100)}%)! (Mất 1 Thoát Thố)"
-                )
-                return
-            thoat_tho_bonus[target.id] = bonus + 0.05
-            dodge_msg = (
-                f"\n🐇 *(Đàn Thoát Thố của {target.display_name} đã ùa ra cản đòn nhưng thất bại! "
-                f"Tỉ lệ né ván sau tăng thành {int((total_chance + 0.05) * 100)}%. Mất 1 Thoát Thố)*"
-            )
-
-        mins = 2 if item.value == "ngoc_khuyen" else 5
-        try:
-            until = discord.utils.utcnow() + timedelta(minutes=mins)
-            await target.timeout(until, reason=f"Bị {attacker.display_name} dùng {name}")
-        except discord.Forbidden:
-            await adb(update_user_item, attacker.id, item.value, 1)    # hoàn lại vật phẩm
-            await interaction.response.send_message(
-                f"❌ Tôi không đủ quyền để mute {target.mention}. Hãy kiểm tra Role của Megumi trong Server Settings "
-                f"có cao hơn người này chưa và đã được cấp quyền Timeout Members chưa. (Đã hoàn lại {name})",
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException as e:
-            await adb(update_user_item, attacker.id, item.value, 1)
-            handle_discord_http_error(e)
-            await interaction.response.send_message(f"❌ Có lỗi khi mute: {e}. (Đã hoàn lại {name})", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"💥 **{attacker.display_name}** đã dùng **{name}**!{dodge_msg}\n"
-            f"🔇 {target.mention} đã bị dính đòn và bị **CẤM NGÔN (Mute) {mins} phút**!"
-        )
-
-    @app_commands.command(name="trade", description="Chuyển Chú lực cho người khác")
-    @app_commands.guild_only()
-    @app_commands.describe(member="Người nhận", amount="Số lượng Chú lực")
-    async def trade_chu_luc(self, interaction: discord.Interaction, member: discord.Member,
-                            amount: app_commands.Range[int, 1, 1_000_000_000]):
-        if member.id == interaction.user.id:
-            await interaction.response.send_message("Định tự chuyển cho chính mình à?", ephemeral=True)
-            return
-        if member.bot:
-            await interaction.response.send_message("Bot không cần Chú lực.", ephemeral=True)
-            return
-        if not await adb(try_spend, interaction.user.id, amount):
-            data = await adb(get_user, interaction.user.id)
-            await interaction.response.send_message(f"Không đủ Chú lực. Cậu chỉ có {data[1]:,}.", ephemeral=True)
-            return
-        await adb(update_user_chu_luc, member.id, amount)
-        await interaction.response.send_message(
-            f"💸 **{interaction.user.display_name}** đã chuyển **{amount:,} Chú lực** cho {member.mention}."
-        )
-
-    # ---------- ADMIN ----------
-    @app_commands.command(name="admin_add", description="Admin: Bơm Chú lực cho user")
-    @app_commands.guild_only()
-    async def admin_add(self, interaction: discord.Interaction, member: discord.Member,
-                        amount: app_commands.Range[int, 1, 1_000_000_000_000]):
-        if not is_owner(interaction):
-            await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
-            return
-        await adb(update_user_chu_luc, member.id, amount)
-        await interaction.response.send_message(f"🛠️ (Admin) Đã bơm **{amount:,} Chú lực** cho {member.mention}.")
-
-    @app_commands.command(name="admin_remove", description="Admin: Trừ Chú lực của user")
-    @app_commands.guild_only()
-    async def admin_remove(self, interaction: discord.Interaction, member: discord.Member,
-                           amount: app_commands.Range[int, 1, 1_000_000_000_000]):
-        if not is_owner(interaction):
-            await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
-            return
-        data = await adb(get_user, member.id)
-        if data[1] < amount:
-            await adb(update_user_chu_luc, member.id, -data[1])
-            await interaction.response.send_message(
-                f"🛠️ (Admin) Đã tước đoạt toàn bộ **{data[1]:,} Chú lực** còn lại của {member.mention}."
-            )
-        else:
-            await adb(update_user_chu_luc, member.id, -amount)
-            await interaction.response.send_message(
-                f"🛠️ (Admin) Đã trừng phạt, tước đi **{amount:,} Chú lực** của {member.mention}."
-            )
-
-    @app_commands.command(name="admin_remove_item", description="Admin: Thu hồi Thức thần của một người")
-    @app_commands.guild_only()
-    @app_commands.choices(item=ITEM_CHOICES)
-    async def admin_remove_item(self, interaction: discord.Interaction, member: discord.Member,
-                                item: app_commands.Choice[str]):
-        if not is_owner(interaction):
-            await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
-            return
-        data = await adb(get_user, member.id)
-        have = data[ITEM_INDEX[item.value]]
-        if have <= 0:
-            await interaction.response.send_message(f"❌ {member.mention} không có {item.name} để thu hồi.", ephemeral=True)
-            return
-        if item.value == "mahoraga":
-            await adb(update_user_item, member.id, item.value, -have)
-            await interaction.response.send_message(f"🛠️ (Admin) Đã tước đoạt **{item.name}** khỏi {member.mention}.")
-        else:
-            await adb(update_user_item, member.id, item.value, -1)
-            await interaction.response.send_message(f"🛠️ (Admin) Đã thu hồi 1 **{item.name}** của {member.mention}.")
-
-    @app_commands.command(name="admin_spawn_boss", description="Admin: Triệu hồi Dị thể Megumi để Raid")
-    async def admin_spawn_boss(self, interaction: discord.Interaction):
-        if not is_owner(interaction):
-            await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
-            return
-        if interaction.channel is None:
-            await interaction.response.send_message("Không xác định được kênh.", ephemeral=True)
-            return
-        await interaction.response.send_message("⚠️ Đang giải phóng Dị thể...", ephemeral=True)
-        spawn_background(spawn_boss(interaction.channel))
-
-    @app_commands.command(name="sync", description="Admin: Đồng bộ lệnh Slash")
-    @app_commands.guild_only()
-    async def slash_sync_commands(self, interaction: discord.Interaction):
-        if not is_owner(interaction):
-            await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        try:
-            tree = self.bot.tree
-            tree.clear_commands(guild=interaction.guild)
-            await tree.sync(guild=interaction.guild)
-            synced = await tree.sync()
-            await interaction.followup.send(
-                f"Đã dọn sạch lệnh rác và đồng bộ {len(synced)} lệnh. Bấm Ctrl+R trên Discord để cập nhật giao diện."
-            )
-        except discord.HTTPException as e:
-            handle_discord_http_error(e)
-            await interaction.followup.send(f"Lỗi: {e}")
-
-
-# ==============================================================================
-# 9. BOT CHÍNH
-# ==============================================================================
-INITIAL_LOGIN_BACKOFF = 300   # 5 phút
-MAX_LOGIN_BACKOFF = 1800      # 30 phút
-login_backoff = INITIAL_LOGIN_BACKOFF
-
-
-class MegumiTree(app_commands.CommandTree):
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        try_spawn_random_boss(interaction.channel)   # cơ hội boss xuất hiện khi dùng lệnh
         return True
-
-    async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        orig = getattr(error, "original", error)
-        if isinstance(orig, discord.HTTPException):
-            handle_discord_http_error(orig)
-            return
-        print(f"❌ [LỖI LỆNH /{getattr(interaction.command, 'name', '?')}] {type(orig).__name__}: {orig}", flush=True)
-        try:
-            msg = "...Tôi đang bận. Lát nữa nói chuyện sau."
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except Exception:
-            pass
+    return False
 
 
 class MegumiBot(commands.Bot):
@@ -1367,17 +1026,428 @@ class MegumiBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(
-            command_prefix=commands.when_mentioned,
+            command_prefix="?megumi ",
             intents=intents,
             help_command=None,
-            tree_cls=MegumiTree,
-            # Đặt presence ngay lúc đăng nhập -> không tốn thêm request nào
-            activity=discord.Activity(type=discord.ActivityType.watching, name="Triệu hồi Thức thần | Gọi 'megumi'"),
+            allowed_mentions=SAFE_MENTIONS,
         )
+        self._synced = False
 
     async def setup_hook(self):
+        tree = self.tree
+
+        # Cơ hội boss xuất hiện khi dùng lệnh + bắt lỗi lệnh chung
+        async def _interaction_check(interaction: discord.Interaction) -> bool:
+            try_spawn_random_boss(interaction.channel)
+            return True
+
+        async def _tree_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            orig = getattr(error, "original", error)
+            if isinstance(orig, discord.HTTPException):
+                handle_discord_http_error(orig)
+                return
+            print(f"❌ [LỖI LỆNH /{getattr(interaction.command, 'name', '?')}] {type(orig).__name__}: {orig}", flush=True)
+            try:
+                msg = "...Tôi đang bận. Lát nữa nói chuyện sau."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                pass
+
+        tree.interaction_check = _interaction_check
+        tree.on_error = _tree_error
+
+        # ---------- THÔNG TIN ----------
+        @tree.command(name="check", description="Kiểm tra lượng Chú lực và Chuỗi điểm danh của bạn")
+        async def check_stats(interaction: discord.Interaction):
+            data = await adb(get_user, interaction.user.id)
+            embed = discord.Embed(
+                title="📊 Thông Tin Chú Thuật Sư",
+                description=(
+                    f"**{interaction.user.display_name}**\n\n"
+                    f"🔹 **Chú lực:** {data[1]:,}\n🔥 **Chuỗi điểm danh (Streak):** {data[3]} ngày"
+                ),
+                color=0x2F3136,
+            )
+            if interaction.user.display_avatar:
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await interaction.response.send_message(embed=embed)
+
+        @tree.command(name="daily", description="Điểm danh mỗi ngày để nhận Chú lực")
+        async def daily_reward(interaction: discord.Interaction):
+            uid = str(interaction.user.id)
+            async with user_lock(uid):
+                data = await adb(get_user, uid)
+                streak = data[3]
+                now = now_vn()
+                today = now.date()
+                last_date = to_vn_date(data[2])
+                reward = 100
+
+                if last_date == today:
+                    await interaction.response.send_message(
+                        "Hôm nay cậu đã nạp chú lực rồi. Đừng làm phiền, quay lại vào ngày mai.", ephemeral=True
+                    )
+                    return
+                if last_date == today - timedelta(days=1):
+                    streak += 1
+                    reward += min(streak * 10, 200)
+                else:
+                    streak = 1
+
+                await adb(update_user_daily, uid, reward, now.isoformat(), streak)
+
+            embed = discord.Embed(
+                title="🎁 Nạp Chú Lực Hằng Ngày",
+                description=f"Cậu đã nhận được **{reward} Chú lực**.\n🔥 **Streak hiện tại:** {streak} ngày",
+                color=0x10B981,
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @tree.command(name="top", description="Bảng xếp hạng Chú lực")
+        async def top_chu_luc(interaction: discord.Interaction):
+            await interaction.response.defer()
+            top_users = await adb(get_top_users, 10)
+            if not top_users:
+                await interaction.followup.send("Chưa có ai sở hữu Chú lực cả.")
+                return
+            desc = "".join(f"**{i}.** <@{uid}> - {cl:,} Chú lực\n" for i, (uid, cl) in enumerate(top_users, 1))
+            await interaction.followup.send(
+                embed=discord.Embed(title="🏆 Bảng Xếp Hạng Chú Lực", description=desc, color=0x3B82F6)
+            )
+
+        @tree.command(name="clearmem", description="Xóa sạch ký ức trò chuyện của Megumi với cậu")
+        async def slash_clear_memory(interaction: discord.Interaction):
+            reset_memory(interaction.channel_id, interaction.user.id)
+            if interaction.user.id == AUTHORIZED_ADMIN_ID:
+                desc = "Tôi đã xóa sạch những chuyện lặt vặt vừa rồi. Có nhiệm vụ gì mới sao, Seiki?"
+            else:
+                desc = f"Những chuyện không cần thiết tôi đã bỏ qua hết rồi. Vào việc chính đi, {interaction.user.display_name}."
+            await interaction.response.send_message(
+                embed=discord.Embed(title="🧹 Làm Mới Trạng Thái", description=desc, color=0x2C2F33)
+            )
+
+        # ---------- CỜ BẠC (COOLDOWN 2 PHÚT) ----------
+        @tree.command(name="slot", description="Cược Chú lực vào Slot Machine (cooldown 2 phút)")
+        @app_commands.describe(amount="Số lượng Chú lực muốn cược")
+        async def slot_machine(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1_000_000_000]):
+            if await block_if_cooldown(interaction, "slot"):
+                return
+            uid = str(interaction.user.id)
+            cd_start(uid, "slot")                      # giữ chỗ trước khi await để chống spam
+            if not await adb(try_spend, uid, amount):
+                cd_clear(uid, "slot")                  # không đủ tiền -> không bị phạt cooldown
+                data = await adb(get_user, uid)
+                await interaction.response.send_message(f"Không đủ Chú lực. Cậu chỉ có {data[1]:,}.", ephemeral=True)
+                return
+
+            slots = ["🐺", "🦉", "🐸", "🐍", "🐰", "🐘", "🐂", "🦌"]
+            result = [random.choice(slots) for _ in range(3)]
+            won = True
+            if result[0] == result[1] == result[2]:
+                winnings = amount * 5
+                msg = f"Tốt lắm. Trúng giải độc đắc rồi. Cậu nhận được **{winnings:,} Chú lực**."
+            elif result[0] == result[1] or result[1] == result[2] or result[0] == result[2]:
+                winnings = amount * 2
+                msg = f"Cũng tạm. Cậu nhận được **{winnings:,} Chú lực**."
+            else:
+                winnings = 0
+                won = False
+                msg = f"Thua trắng rồi. Cậu mất **{amount:,} Chú lực**. Lần sau tính toán kỹ hơn đi."
+            if winnings:
+                await adb(update_user_chu_luc, uid, winnings)
+
+            embed = discord.Embed(
+                title="🎰 Rút Bài Chú Lực (Slot)",
+                description=f"**[ {result[0]} | {result[1]} | {result[2]} ]**\n\n{msg}",
+                color=0xF59E0B if won else 0xDC2626,
+            )
+            await interaction.response.send_message(embed=embed)
+
+        @tree.command(name="coinflip", description="Tung đồng xu cược Chú lực (Thắng x2, cooldown 2 phút)")
+        @app_commands.describe(amount="Số Chú lực cược", choice="Chọn Sấp hoặc Ngửa")
+        @app_commands.choices(choice=[
+            app_commands.Choice(name="Sấp (Heads)", value="sap"),
+            app_commands.Choice(name="Ngửa (Tails)", value="ngua"),
+        ])
+        async def coinflip(interaction: discord.Interaction,
+                           amount: app_commands.Range[int, 1, 1_000_000_000],
+                           choice: app_commands.Choice[str]):
+            if await block_if_cooldown(interaction, "coinflip"):
+                return
+            uid = str(interaction.user.id)
+            cd_start(uid, "coinflip")
+            if not await adb(try_spend, uid, amount):
+                cd_clear(uid, "coinflip")
+                data = await adb(get_user, uid)
+                await interaction.response.send_message(f"Cậu không đủ Chú lực (Đang có: {data[1]:,})", ephemeral=True)
+                return
+
+            outcome = random.choice(["sap", "ngua"])
+            label = "Sấp" if outcome == "sap" else "Ngửa"
+            if choice.value == outcome:
+                await adb(update_user_chu_luc, uid, amount * 2)
+                await interaction.response.send_message(
+                    f"🪙 Đồng xu ra **{label}**!\n🎉 Cậu đã thắng và nhận được **{amount * 2:,} Chú lực** (Lãi {amount:,})."
+                )
+            else:
+                await interaction.response.send_message(
+                    f"🪙 Đồng xu ra **{label}**!\n💀 Cậu đoán sai và mất **{amount:,} Chú lực**."
+                )
+
+        @tree.command(name="dungeon", description="Khám phá Hầm ngục. Phí: 2,000 CL. Nhận 1k-11k CL (1 lần/ngày)")
+        async def dungeon(interaction: discord.Interaction):
+            uid = str(interaction.user.id)
+            async with user_lock(uid):
+                today = now_vn().strftime("%Y-%m-%d")
+                if await adb(get_last_dungeon, uid) == today:
+                    await interaction.response.send_message(
+                        "❌ Cậu đã vào Hầm ngục ngày hôm nay rồi, hãy quay lại vào ngày mai nhé!", ephemeral=True
+                    )
+                    return
+                if not await adb(try_spend, uid, 2000):
+                    data = await adb(get_user, uid)
+                    await interaction.response.send_message(
+                        f"❌ Cậu không đủ 2,000 Chú lực để vào Hầm ngục (Hiện tại có {data[1]:,}).", ephemeral=True
+                    )
+                    return
+                await adb(set_last_dungeon, uid, today)
+                reward = random.randint(1000, 11000)
+                await adb(update_user_chu_luc, uid, reward)
+
+            profit = reward - 2000
+            if profit > 0:
+                msg = f"🎉 **{interaction.user.display_name}** đã dũng cảm bước vào Hầm ngục và tìm thấy **{reward:,} Chú lực**! (Lãi {profit:,} CL)"
+            else:
+                msg = f"🏚️ **{interaction.user.display_name}** bước vào Hầm ngục nhưng chỉ thu thập được **{reward:,} Chú lực**. (Lỗ {-profit:,} CL)"
+            await interaction.response.send_message(
+                embed=discord.Embed(title="⚔️ Khám phá Hầm ngục", description=msg, color=0x3B82F6 if profit > 0 else 0xEF4444)
+            )
+
+        # ---------- CỬA HÀNG / THỨC THẦN ----------
+        @tree.command(name="shop", description="Cửa hàng Thức thần")
+        async def shop(interaction: discord.Interaction):
+            desc = "".join(
+                f"**{v['name']}** - 💰 {v['price']:,} Chú lực\n↳ *{v['desc']}*\n\n" for v in SHOP_ITEMS.values()
+            )
+            embed = discord.Embed(title="🛒 Cửa Hàng Thức Thần", description=desc, color=0x8B5CF6)
+            embed.set_footer(text="Dùng lệnh /buy để mua và /use để dùng")
+            await interaction.response.send_message(embed=embed)
+
+        @tree.command(name="buy", description="Mua vật phẩm từ cửa hàng")
+        @app_commands.choices(item=ITEM_CHOICES)
+        async def buy_item(interaction: discord.Interaction, item: app_commands.Choice[str]):
+            uid = str(interaction.user.id)
+            info = SHOP_ITEMS[item.value]
+            async with user_lock(uid):
+                data = await adb(get_user, uid)
+                if item.value == "mahoraga" and data[8] > 0:
+                    await interaction.response.send_message("Cậu đã sở hữu Mahoraga rồi, mua thêm làm gì?", ephemeral=True)
+                    return
+                if not await adb(try_spend, uid, info["price"]):
+                    await interaction.response.send_message(
+                        f"Không đủ tiền. Cậu chỉ có {data[1]:,} Chú lực (cần {info['price']:,}).", ephemeral=True
+                    )
+                    return
+                await adb(update_user_item, uid, item.value, 1)
+            await interaction.response.send_message(f"🛍️ Cậu đã mua thành công **{info['name']}**!")
+
+        @tree.command(name="inventory", description="Xem túi đồ của cậu")
+        async def inventory(interaction: discord.Interaction):
+            await interaction.response.defer()
+            d = await adb(get_user, interaction.user.id)
+            desc = (
+                f"**Ngọc Khuyển:** {d[5]}\n**Nue:** {d[6]}\n**Thoát Thố:** {d[7]}\n"
+                f"**Mahoraga:** {'Có (Vĩnh viễn)' if d[8] > 0 else 'Không'}"
+            )
+            await interaction.followup.send(
+                embed=discord.Embed(title="🎒 Túi Đồ Thức Thần", description=desc, color=0x22C55E)
+            )
+
+        @tree.command(name="use", description="Dùng Thức thần tấn công (Mute) đối phương (cooldown 2 phút)")
+        @app_commands.guild_only()
+        @app_commands.describe(item="Thức thần muốn dùng", target="Người bị tấn công")
+        @app_commands.choices(item=[
+            app_commands.Choice(name="Ngọc Khuyển (Mute 2p)", value="ngoc_khuyen"),
+            app_commands.Choice(name="Nue (Mute 5p)", value="nue"),
+        ])
+        async def use_item(interaction: discord.Interaction, item: app_commands.Choice[str], target: discord.Member):
+            if target.id == interaction.user.id:
+                await interaction.response.send_message("Bị ngốc à? Tự đánh mình làm gì.", ephemeral=True)
+                return
+            if target.bot:
+                await interaction.response.send_message("Thức thần không đánh bot.", ephemeral=True)
+                return
+            if target.guild_permissions.administrator:
+                await interaction.response.send_message(
+                    "Đối phương là Admin (Kẻ Vô Hạ Hạn), Thức thần của cậu không thể chạm vào họ!", ephemeral=True
+                )
+                return
+            if await block_if_cooldown(interaction, "use"):
+                return
+
+            name = SHOP_ITEMS[item.value]["name"]
+            attacker = interaction.user
+            cd_start(attacker.id, "use")
+            async with user_lock(attacker.id):
+                if not await adb(try_consume_item, attacker.id, item.value):
+                    cd_clear(attacker.id, "use")       # không có đồ -> không bị phạt cooldown
+                    await interaction.response.send_message(
+                        f"Cậu không có {name}. Hãy vào /shop để mua.", ephemeral=True
+                    )
+                    return
+
+            target_data = await adb(get_user, target.id)
+            if target_data[8] > 0:
+                await interaction.response.send_message(
+                    f"🐺 **{attacker.display_name}** tung {name} tấn công {target.mention}!\n"
+                    f"🛡️ NHƯNG! Bánh xe luân hồi quay... **Mahoraga** của {target.display_name} đã thích nghi và hóa giải hoàn toàn đòn tấn công!"
+                )
+                return
+
+            dodge_msg = ""
+            if target_data[7] > 0 and await adb(try_consume_item, target.id, "thoat_tho"):
+                bonus = thoat_tho_bonus.get(target.id, 0.0)
+                total_chance = 0.40 + bonus
+                if random.random() <= total_chance:
+                    thoat_tho_bonus[target.id] = 0.0
+                    await interaction.response.send_message(
+                        f"🐺 **{attacker.display_name}** tung {name} tấn công {target.mention}!\n"
+                        f"🐇 Đàn **Thoát Thố** của {target.display_name} xuất hiện đánh lạc hướng thành công "
+                        f"(Tỷ lệ né: {int(total_chance * 100)}%)! (Mất 1 Thoát Thố)"
+                    )
+                    return
+                thoat_tho_bonus[target.id] = bonus + 0.05
+                dodge_msg = (
+                    f"\n🐇 *(Đàn Thoát Thố của {target.display_name} đã ùa ra cản đòn nhưng thất bại! "
+                    f"Tỉ lệ né ván sau tăng thành {int((total_chance + 0.05) * 100)}%. Mất 1 Thoát Thố)*"
+                )
+
+            mins = 2 if item.value == "ngoc_khuyen" else 5
+            try:
+                until = discord.utils.utcnow() + timedelta(minutes=mins)
+                await target.timeout(until, reason=f"Bị {attacker.display_name} dùng {name}")
+            except discord.Forbidden:
+                await adb(update_user_item, attacker.id, item.value, 1)    # hoàn lại vật phẩm
+                cd_clear(attacker.id, "use")
+                await interaction.response.send_message(
+                    f"❌ Tôi không đủ quyền để mute {target.mention}. Hãy kiểm tra Role của Megumi trong Server Settings "
+                    f"có cao hơn người này chưa và đã được cấp quyền Timeout Members chưa. (Đã hoàn lại {name})",
+                    ephemeral=True,
+                )
+                return
+            except discord.HTTPException as e:
+                await adb(update_user_item, attacker.id, item.value, 1)
+                cd_clear(attacker.id, "use")
+                handle_discord_http_error(e)
+                await interaction.response.send_message(f"❌ Có lỗi khi mute: {e}. (Đã hoàn lại {name})", ephemeral=True)
+                return
+
+            await interaction.response.send_message(
+                f"💥 **{attacker.display_name}** đã dùng **{name}**!{dodge_msg}\n"
+                f"🔇 {target.mention} đã bị dính đòn và bị **CẤM NGÔN (Mute) {mins} phút**!"
+            )
+
+        @tree.command(name="trade", description="Chuyển Chú lực cho người khác")
+        @app_commands.guild_only()
+        @app_commands.describe(member="Người nhận", amount="Số lượng Chú lực")
+        async def trade_chu_luc(interaction: discord.Interaction, member: discord.Member,
+                                amount: app_commands.Range[int, 1, 1_000_000_000]):
+            if member.id == interaction.user.id:
+                await interaction.response.send_message("Định tự chuyển cho chính mình à?", ephemeral=True)
+                return
+            if member.bot:
+                await interaction.response.send_message("Bot không cần Chú lực.", ephemeral=True)
+                return
+            if not await adb(try_spend, interaction.user.id, amount):
+                data = await adb(get_user, interaction.user.id)
+                await interaction.response.send_message(f"Không đủ Chú lực. Cậu chỉ có {data[1]:,}.", ephemeral=True)
+                return
+            await adb(update_user_chu_luc, member.id, amount)
+            await interaction.response.send_message(
+                f"💸 **{interaction.user.display_name}** đã chuyển **{amount:,} Chú lực** cho {member.mention}."
+            )
+
+        # ---------- ADMIN ----------
+        @tree.command(name="admin_add", description="Admin: Bơm Chú lực cho user")
+        @app_commands.guild_only()
+        async def admin_add(interaction: discord.Interaction, member: discord.Member,
+                            amount: app_commands.Range[int, 1, 1_000_000_000_000]):
+            if not is_owner(interaction):
+                await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
+                return
+            await adb(update_user_chu_luc, member.id, amount)
+            await interaction.response.send_message(f"🛠️ (Admin) Đã bơm **{amount:,} Chú lực** cho {member.mention}.")
+
+        @tree.command(name="admin_remove", description="Admin: Trừ Chú lực của user")
+        @app_commands.guild_only()
+        async def admin_remove(interaction: discord.Interaction, member: discord.Member,
+                               amount: app_commands.Range[int, 1, 1_000_000_000_000]):
+            if not is_owner(interaction):
+                await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
+                return
+            data = await adb(get_user, member.id)
+            if data[1] < amount:
+                await adb(update_user_chu_luc, member.id, -data[1])
+                await interaction.response.send_message(
+                    f"🛠️ (Admin) Đã tước đoạt toàn bộ **{data[1]:,} Chú lực** còn lại của {member.mention}."
+                )
+            else:
+                await adb(update_user_chu_luc, member.id, -amount)
+                await interaction.response.send_message(
+                    f"🛠️ (Admin) Đã trừng phạt, tước đi **{amount:,} Chú lực** của {member.mention}."
+                )
+
+        @tree.command(name="admin_remove_item", description="Admin: Thu hồi Thức thần của một người")
+        @app_commands.guild_only()
+        @app_commands.choices(item=ITEM_CHOICES)
+        async def admin_remove_item(interaction: discord.Interaction, member: discord.Member,
+                                    item: app_commands.Choice[str]):
+            if not is_owner(interaction):
+                await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
+                return
+            data = await adb(get_user, member.id)
+            have = data[ITEM_INDEX[item.value]]
+            if have <= 0:
+                await interaction.response.send_message(f"❌ {member.mention} không có {item.name} để thu hồi.", ephemeral=True)
+                return
+            if item.value == "mahoraga":
+                await adb(update_user_item, member.id, item.value, -have)
+                await interaction.response.send_message(f"🛠️ (Admin) Đã tước đoạt **{item.name}** khỏi {member.mention}.")
+            else:
+                await adb(update_user_item, member.id, item.value, -1)
+                await interaction.response.send_message(f"🛠️ (Admin) Đã thu hồi 1 **{item.name}** của {member.mention}.")
+
+        @tree.command(name="admin_spawn_boss", description="Admin: Triệu hồi Dị thể Megumi để Raid")
+        async def admin_spawn_boss(interaction: discord.Interaction):
+            if not is_owner(interaction):
+                await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
+                return
+            if interaction.channel is None:
+                await interaction.response.send_message("Không xác định được kênh.", ephemeral=True)
+                return
+            await interaction.response.send_message("⚠️ Đang giải phóng Dị thể...", ephemeral=True)
+            spawn_background(spawn_boss(interaction.channel))
+
+        @tree.command(name="sync", description="Admin: Đồng bộ lệnh Slash")
+        async def slash_sync_commands(interaction: discord.Interaction):
+            if not is_owner(interaction):
+                await interaction.response.send_message(NOT_OWNER_MSG, ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                synced = await tree.sync()
+                await interaction.followup.send(
+                    f"Đã đồng bộ {len(synced)} lệnh. Bấm Ctrl+R trên Discord để cập nhật giao diện."
+                )
+            except discord.HTTPException as e:
+                handle_discord_http_error(e)
+                await interaction.followup.send(f"Lỗi: {e}")
+
+        # ---------- ĐỒNG BỘ LỆNH (GIỐNG REIMU) ----------
         global _commands_synced
-        await self.add_cog(MegumiCog(self))
         if SYNC_COMMANDS and not _commands_synced and not is_discord_blocked():
             try:
                 synced = await self.tree.sync()
@@ -1395,6 +1465,8 @@ class MegumiBot(commands.Bot):
         print(f"✅ [BOT] Đã đăng nhập: {self.user.name} ({self.user.id})", flush=True)
         print(f"🔑 Số API Key Gemini đang kích hoạt: {len(GEMINI_CLIENTS)}", flush=True)
         print(f"💾 Database: {'MongoDB' if use_mongo else 'SQLite'}", flush=True)
+        print(f"⏳ Cooldown cờ bạc/thức thần: {GAME_COOLDOWN}s", flush=True)
+        print("🐺 Megumi Fushiguro sẵn sàng phục vụ!", flush=True)
         print("==================================================", flush=True)
         if GEMINI_CLIENTS:
             await get_active_models()
@@ -1421,6 +1493,9 @@ class MegumiBot(commands.Bot):
             except Exception as e:
                 print(f"⚠️ [CHAT REWARD] {type(e).__name__}: {str(e)[:120]}", flush=True)
             try_spawn_random_boss(message.channel)
+
+        if message.content.startswith("!") or message.content.startswith("/"):
+            return
 
         if is_discord_blocked():
             return
@@ -1493,7 +1568,7 @@ class MegumiBot(commands.Bot):
 
 
 # ==============================================================================
-# 10. KHỞI CHẠY BOT AN TOÀN (KHÔNG THOÁT PROCESS, KHÔNG RESTART DỒN DẬP)
+# 10. KHỞI CHẠY BOT AN TOÀN (KHÔNG RESTART DỒN DẬP)
 # ==============================================================================
 async def main():
     global login_backoff
@@ -1524,7 +1599,7 @@ async def main():
                 print(f"⚠️ [HTTP {e.status}] {e}. Thử lại sau {wait}s...", flush=True)
         except Exception as e:
             wait = 60
-            print(f"❌ [CRASH] {type(e).__name__}: {e}. Thử lại sau {wait}s...", flush=True)
+            print(f"❌ [CRASH] {type(e).__name__}: {e}\n{traceback.format_exc()}\nThử lại sau {wait}s...", flush=True)
 
         await asyncio.sleep(wait + random.uniform(0, 10))
 
